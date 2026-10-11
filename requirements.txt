@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-pdfplumber
+pymupdf
 pythainlp
 python-multipart

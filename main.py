@@ -19,23 +19,43 @@ app.add_middleware(
 def extract_and_clean_pdf(file_bytes: bytes) -> str:
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
-        full_text = ""
-        for page in doc:
-            blocks = page.get_text("blocks")
-            blocks.sort(key=lambda b: (round(b[1] / 5) * 5, b[0]))
-            for b in blocks:
-                block_text = b[4].strip()
-                if block_text:
-                    full_text += block_text + "\n"
+        paragraphs = []
         
-        # 👑 ระบบอัตโนมัติ Python RegEx: แปลงพยัญชนะที่ตามด้วยช่องว่างและสระอา/สระอำ ให้เป็นสระอำ (ำ)
-        # โดยมีเกราะป้องกัน (Negative Lookbehind) ไม่ให้ไปกระทบโครงสร้างสระเอา (เ-า)
+        for page in doc:
+            # ดึงโครงสร้างข้อความแบบละเอียด (Dict blocks) เพื่อรวมบรรทัดในย่อหน้าเดียวกัน
+            text_page = page.get_text("dict")
+            for block in text_page.get("blocks", []):
+                if block.get("type") == 0:  # Text block (ย่อหน้า/บล็อกข้อความ)
+                    paragraph_lines = []
+                    for line in block.get("lines", []):
+                        line_str = "".join([span.get("text", "") for span in line.get("spans", "")]).strip()
+                        if line_str:
+                            paragraph_lines.append(line_str)
+                    
+                    if paragraph_lines:
+                        # รวมบรรทัดที่ห่ออยู่ในย่อหน้าเดียวกันให้เป็นข้อความยาวต่อเนื่องเหมือน Word
+                        joined_line = ""
+                        for i, l in enumerate(paragraph_lines):
+                            if i == 0:
+                                joined_line += l
+                            else:
+                                # หากเป็นภาษาอังกฤษ/ตัวเลข ให้เว้นวรรค หากเป็นภาษาไทยเชื่อมต่อกันตามธรรมชาติ
+                                if re.search(r'[a-zA-Z0-9]$', joined_line) and re.search(r'^[a-zA-Z0-9]', l):
+                                    joined_line += " " + l
+                                else:
+                                    joined_line += l
+                        paragraphs.append(joined_line)
+        
+        # เชื่อมแต่ละย่อหน้าด้วยขึ้นบรรทัดใหม่
+        full_text = "\n\n".join(paragraphs)
+        
+        # ระบบจัดการสระอำอัตโนมัติ (พร้อมเกราะป้องกันสระเอา เ-า)
         cleaned_text = re.sub(r'(?<!เ)([ก-ฮ])\s+([ำา])', r'\1ำ', full_text)
         
         # ทำความสะอาดมาตรฐานด้วย PyThaiNLP และ Unicode NFC
         normalized_text = thai_normalize(cleaned_text)
         
-        # จัดระเบียบช่องว่างส่วนเกินในแต่ละบรรทัดให้เรียบร้อย
+        # จัดระเบียบช่องว่างส่วนเกิน
         lines = normalized_text.splitlines()
         final_lines = [re.sub(r'\s+', ' ', line).strip() for line in lines if line.strip()]
         return "\n".join(final_lines)

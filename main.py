@@ -9,6 +9,9 @@ from fastapi.responses import FileResponse
 from pdf2docx import Converter
 import tempfile
 import docx
+from docx.shared import Pt
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 
 app = FastAPI(title="e-GovDoc Python Backend Engine")
 
@@ -132,7 +135,6 @@ async def extract_pdf_endpoint(file: UploadFile = File(...)):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
-
 @app.post("/api/pdf-to-word")
 async def pdf_to_word_endpoint(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
@@ -152,33 +154,48 @@ async def pdf_to_word_endpoint(file: UploadFile = File(...)):
         cv.convert(docx_path, start=0, end=None)
         cv.close()
         
-        # 2. เปิดไฟล์ Word ผลลัพธ์ด้วย python-docx เพื่อซ่อมแซมสระอำเด็ดขาด
+        # 2. เปิดไฟล์ Word ด้วย python-docx เพื่อจัดการสระอำและบังคับฟอนต์ TH Sarabun New
         doc = docx.Document(docx_path)
         
-        def fix_sara_am(text):
-            if not text:
-                return text
-            # กฎสระอำ: พยัญชนะไทย [ก-ฮ] + ช่องว่าง (\s+) + สระอา (า) -> แปลงเป็นสระอำ (ำ) ทันที
-            return re.sub(r'([ก-ฮ])\s+([า])', r'\1ำ', text)
-
-        # แก้ไขในทุกย่อหน้า (Paragraphs)
-        for p in doc.paragraphs:
+        # ตั้งค่า Style หลักของเอกสารเป็น TH Sarabun New ขนาด 16 pt
+        normal_style = doc.styles['Normal']
+        normal_style.font.name = 'TH Sarabun New'
+        normal_style.font.size = Pt(16)
+        
+        def fix_text_and_apply_font(p):
             if p.text:
-                fixed_text = fix_sara_am(p.text)
+                # แก้ไขสระอำเด็ดขาด (พยัญชนะ + ช่องว่าง + สระอา -> สระอำ)
+                fixed_text = re.sub(r'([ก-ฮ])\s+([า])', r'\1ำ', p.text)
                 if fixed_text != p.text:
                     p.text = fixed_text
+                
+                # บังคับฟอนต์ TH Sarabun New ให้กับทุกตัวอักษร (Runs) ในพารากราฟ
+                for run in p.runs:
+                    run.font.name = 'TH Sarabun New'
+                    run.font.size = Pt(16)
+                    
+                    # เซ็ต XML สำหรับภาษาไทย (Complex Script) เพื่อให้ Word บังคับแสดงผลฟอนต์นี้ 100%
+                    rPr = run._r.get_or_add_rPr()
+                    rFonts = rPr.find(qn('w:rFonts'))
+                    if rFonts is None:
+                        rFonts = OxmlElement('w:rFonts')
+                        rPr.append(rFonts)
+                    rFonts.set(qn('w:ascii'), 'TH Sarabun New')
+                    rFonts.set(qn('w:hAnsi'), 'TH Sarabun New')
+                    rFonts.set(qn('w:cs'), 'TH Sarabun New')
 
-        # แก้ไขในทุกตาราง (Tables) ถ้ามี
+        # วนลูปแก้ทุกย่อหน้า
+        for p in doc.paragraphs:
+            fix_text_and_apply_font(p)
+
+        # วนลูปแก้ทุกตาราง (ถ้ามี)
         for table in doc.tables:
             for row in table.rows:
                 for cell in row.cells:
                     for p in cell.paragraphs:
-                        if p.text:
-                            fixed_text = fix_sara_am(p.text)
-                            if fixed_text != p.text:
-                                p.text = fixed_text
+                        fix_text_and_apply_font(p)
                                 
-        # บันทึกไฟล์ Word ที่ซ่อมแซมสระอำแล้วทับลงไป
+        # บันทึกไฟล์ Word ที่ปรับแต่งเรียบร้อยแล้ว
         doc.save(docx_path)
         
         # 3. ส่งไฟล์ Word กลับไปให้ผู้ใช้งานดาวน์โหลด

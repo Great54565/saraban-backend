@@ -5,6 +5,9 @@ from pythainlp.util import normalize as thai_normalize
 import uvicorn
 import re
 import os
+from fastapi.responses import FileResponse
+from pdf2docx import Converter
+import tempfile
 
 app = FastAPI(title="e-GovDoc Python Backend Engine")
 
@@ -128,3 +131,41 @@ async def extract_pdf_endpoint(file: UploadFile = File(...)):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
+
+@app.post("/api/pdf-to-word")
+async def pdf_to_word_endpoint(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="กรุณาอัปโหลดไฟล์ PDF เท่านั้น")
+    
+    # สร้างไฟล์ชั่วคราวสำหรับ PDF และ DOCX ผลลัพธ์
+    pdf_fd, pdf_path = tempfile.mkstemp(suffix=".pdf")
+    os.close(pdf_fd)
+    docx_path = pdf_path.replace(".pdf", ".docx")
+    
+    try:
+        content = await file.read()
+        with open(pdf_path, "wb") as f:
+            f.write(content)
+            
+        # แปลง PDF เป็น Word ด้วย pdf2docx
+        cv = Converter(pdf_path)
+        cv.convert(docx_path, start=0, end=None)
+        cv.close()
+        
+        # ส่งไฟล์ Word กลับไปให้ผู้ใช้ดาวน์โหลด
+        output_filename = file.filename.rsplit(".", 1)[0] + ".docx"
+        return FileResponse(
+            docx_path,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            filename=output_filename
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"เกิดข้อผิดพลาดในการแปลงไฟล์: {str(e)}")
+    finally:
+        # ทำความสะอาดไฟล์ชั่วคราวในระบบ (ถ้ามี)
+        if os.path.exists(pdf_path):
+            try:
+                os.remove(pdf_path)
+            except:
+                pass

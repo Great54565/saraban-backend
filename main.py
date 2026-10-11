@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import fitz  # PyMuPDF ตัวจริงที่อ่านตัวอักษรไทยได้แม่นยำ ไม่เพี้ยน
+import fitz  # PyMuPDF อ่านตัวอักษรไทยแม่นยำ ไม่เพี้ยน
 from pythainlp.util import normalize as thai_normalize
 import uvicorn
 import re
@@ -16,35 +16,78 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def process_smart_structural_lines(raw_text: str) -> str:
+    lines = raw_text.splitlines()
+    processed_lines = []
+    
+    # 📌 กฎโครงสร้างหนังสือราชการ: หัวข้อสำคัญและรายการเหล่านี้ "ต้องขึ้นบรรทัดใหม่เสมอ (Hard Break)"
+    hard_break_pattern = re.compile(
+        r'^(บันทึกข้อความ|ส่วนราชการ\s*[:：]|ที่\s*[:：]|วันที่\s*[:：]|เรื่อง\s*[:：]|เรียน\s*[:：]|\d+[\.\)]|[๑-๙]+[\.\)]|[ก-ฮ][\.\)]|[-•*])'
+    )
+
+    current_para = ""
+
+    for line in lines:
+        clean_line = line.strip()
+        if not clean_line:
+            if current_para:
+                processed_lines.append(current_para)
+                current_para = ""
+            continue
+        
+        # ตรวจสอบว่าเป็นหัวข้อหรือรายการสำคัญตามระเบียบสารบรรณหรือไม่
+        if hard_break_pattern.match(clean_line):
+            if current_para:
+                processed_lines.append(current_para)
+                current_para = ""
+            processed_lines.append(clean_line)
+        else:
+            # เนื้อความภายในย่อหน้าเดียวกัน (Soft Break): นำมาเชื่อมต่อกันเป็นประโยคยาวแบบ Word
+            if not current_para:
+                current_para = clean_line
+            else:
+                last_char = current_para[-1]
+                first_char = clean_line[0]
+                is_thai_left = bool(re.match(r'[\u0E00-\u0E7F]', last_char))
+                is_thai_right = bool(re.match(r'[\u0E00-\u0E7F]', first_char))
+                
+                # ถ้าเป็นตัวอักษรไทยทั้งคู่ แปลว่าถูก PDF ตัดบรรทัดกลางคำ -> เชื่อมติดกันอย่างไร้รอยต่อ
+                if is_thai_left and is_thai_right:
+                    current_para += clean_line
+                else:
+                    current_para += " " + clean_line
+
+    if current_para:
+        processed_lines.append(current_para)
+
+    return "\n".join(processed_lines)
+
 def extract_and_clean_pdf(file_bytes: bytes) -> str:
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
-        paragraphs = []
+        page_texts = []
         
         for page in doc:
-            # ดึงข้อมูลแบบ blocks ซึ่ง Word มักจะจัด 1 ย่อหน้า เป็น 1 Block เสมอ
-            blocks = page.get_text("blocks")
-            # เรียงลำดับพิกัดจากบนลงล่าง ซ้ายไปขวา
-            blocks.sort(key=lambda b: (round(b[1] / 10) * 10, b[0]))
-            
-            for b in blocks:
-                if b[6] == 0:  # Text block
-                    block_text = b[4].strip()
-                    if block_text:
-                        # แทนที่การขึ้นบรรทัดใหม่ภายใน Block เดียวกัน ให้เป็นช่องว่าง เพื่อรวมย่อหน้าให้ยาวต่อเนื่องเหมือน Word
-                        cleaned_block = re.sub(r'\r?\n', ' ', block_text)
-                        # จัดระเบียบช่องว่างซ้ำซ้อน
-                        cleaned_block = re.sub(r'[ \t]+', ' ', cleaned_block).strip()
-                        if cleaned_block:
-                            paragraphs.append(cleaned_block)
+            text = page.get_text("text")
+            if text:
+                page_texts.append(text)
         
-        # เชื่อมแต่ละย่อหน้าด้วยขึ้นบรรทัดใหม่
-        full_text = "\n\n".join(paragraphs)
+        full_text = "\n".join(page_texts)
         
-        # ทำความสะอาดมาตรฐานด้วย PyThaiNLP (รักษาคำว่า ตุลาคม, จำกัด ไว้ครบถ้วนสมบูรณ์)
-        normalized_text = thai_normalize(full_text)
+        # 1. จัดระเบียบย่อหน้าและบรรทัดด้วยระบบโครงสร้างสารบรรณ (Smart Structural Line Breaking)
+        structured_text = process_smart_structural_lines(full_text)
         
-        return normalized_text
+        # 2. 👑 ล็อกกฎสระอำเด็ดขาด 100%: พยัญชนะ [ก-ฮ] + ช่องว่าง (\s+) + สระอา (า) -> สระอำ (ำ)
+        structured_text = re.sub(r'([ก-ฮ])\s+([า])', r'\1ำ', structured_text)
+        
+        # 3. ทำความสะอาดมาตรฐานด้วย Unicode Normalization ของ PyThaiNLP
+        normalized_text = thai_normalize(structured_text)
+        
+        # 4. จัดระเบียบช่องว่างย่อหน้าให้สะอาดเรียบร้อย
+        lines = normalized_text.splitlines()
+        final_lines = [re.sub(r'[ \t]+', ' ', line).strip() for line in lines]
+        
+        return "\n".join(l for l in final_lines if l)
         
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"ไม่สามารถอ่านไฟล์ PDF ได้: {str(e)}")

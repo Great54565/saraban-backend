@@ -1,5 +1,6 @@
 fastapi
 uvicorn
 pymupdf
+pdf2docx
 pythainlp
 python-multipart

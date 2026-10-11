@@ -2,7 +2,6 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import fitz  # PyMuPDF
 from pythainlp.util import normalize as thai_normalize
-from pythainlp.corpus import thai_words
 import uvicorn
 import re
 import os
@@ -17,50 +16,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 👑 หัวใจสำคัญ: โหลดพจนานุกรมภาษาไทยมาตรฐาน (Library-based, ปลอดฮาร์ดโค้ด 100%)
-THAI_DICT = set(thai_words())
-
 def extract_and_clean_pdf(file_bytes: bytes) -> str:
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
-        full_text = ""
+        paragraphs = []
         
-        # 1. สกัดข้อความแบบอนุรักษ์โครงสร้าง (รักษา \n ไว้เป๊ะๆ เพื่อไม่ให้ข้อความไหลชนกัน)
         for page in doc:
-            full_text += page.get_text("text") + "\n"
-        
-        # 2. แก้ไขช่องว่างทางกายภาพที่ผิดปกติจาก PDF (เช่น ส าคัญ -> สำคัญ)
-        full_text = re.sub(r'(?<!เ)([ก-ฮ])\s+([ำา])', r'\1ำ', full_text)
-        
-        # 3. 🧠 Smart Dictionary Auto-Correction (แก้ ดาเนิน -> ดำเนิน โดยไม่ฮาร์ดโค้ด)
-        # หาพิกัดของพยัญชนะ [ก-ฮ] ที่ตามด้วย 'า' ทั้งหมดในเอกสาร
-        indices = [m.start() for m in re.finditer(r'(?<!เ)[ก-ฮ]า', full_text)]
-        text_list = list(full_text)
-        
-        for idx in indices:
-            a_idx = idx + 1  # ตำแหน่งของสระ 'า'
+            blocks = page.get_text("blocks")
+            blocks.sort(key=lambda b: (round(b[1] / 10) * 10, b[0]))
             
-            # สร้าง Window สแกนหาคำที่เป็นไปได้รอบๆ จุดนั้น (ความยาว 2 ถึง 15 ตัวอักษร)
-            for length in range(15, 1, -1):
-                end_idx = idx + length
-                if end_idx <= len(text_list):
-                    original_chunk = "".join(text_list[idx:end_idx])
-                    cand_chunk = original_chunk.replace('า', 'ำ', 1)
-                    
-                    # ตรรกะอัจฉริยะ: ถ้าเปลี่ยนเป็น ำ แล้วเป็นคำที่ถูกต้องในดิกชันนารี 
-                    # และคำเดิมที่ใช้ า ไม่มีความหมาย -> ถือว่าเป็น Typo จาก PDF แน่นอน! ฟันธงแก้ทันที!
-                    if cand_chunk in THAI_DICT and original_chunk not in THAI_DICT:
-                        text_list[a_idx] = 'ำ'
-                        break  # แก้ไขสำเร็จ ข้ามไปจุดต่อไป
+            for b in blocks:
+                if b[6] == 0:  # Text block
+                    block_text = b[4].strip()
+                    if block_text:
+                        # 1. เชื่อมคำไทยที่ถูกตัดบรรทัดกลางประโยค (Soft Wrap) จากโครงสร้าง PDF
+                        block_text = re.sub(r'([\u0E00-\u0E7F])\r?\n([\u0E00-\u0E7F])', r'\1\2', block_text)
                         
-        corrected_text = "".join(text_list)
+                        # 2. แปลงการขึ้นบรรทัดใหม่ที่เหลือในบล็อกให้เป็นช่องว่างเพื่อให้โครงสร้างไหลต่อเนื่อง
+                        block_text = re.sub(r'\r?\n', ' ', block_text)
+                        paragraphs.append(block_text)
         
-        # 4. ทำความสะอาด Unicode ขั้นสุดท้ายด้วย PyThaiNLP
-        normalized_text = thai_normalize(corrected_text)
+        full_text = "\n\n".join(paragraphs)
         
-        # 5. จัดระเบียบตัดช่องว่างหัวท้ายบรรทัด แต่ยังคงรักษาย่อหน้า \n ไว้ตามต้นฉบับ 100%
-        final_lines = [line.strip() for line in normalized_text.splitlines()]
-        return "\n".join(l for l in final_lines if l)
+        # 3. แก้ไขเฉพาะช่องว่างทางเทคนิคของฟอนต์ PDF (เช่น สระและวรรณยุกต์ถูกแยกช่องว่างออก)
+        full_text = re.sub(r'(?<!เ)([ก-ฮ])\s+([ำา\u0E4D])', r'\1\2', full_text)
+        
+        # 4. ทำความสะอาดมาตรฐานด้วย Unicode Normalization (ไม่มีการใช้พจนานุกรมแก้คำผิด)
+        normalized_text = thai_normalize(full_text)
+        
+        # 5. จัดระเบียบช่องว่างส่วนเกิน
+        final_paras = [re.sub(r' {2,}', ' ', p).strip() for p in normalized_text.split("\n\n") if p.strip()]
+        
+        return "\n\n".join(final_paras)
         
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"ไม่สามารถอ่านไฟล์ PDF ได้: {str(e)}")

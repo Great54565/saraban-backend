@@ -1,10 +1,9 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import pdfplumber
+import fitz  # PyMuPDF ตัวจริงที่อ่านตัวอักษรไทยได้แม่นยำ ไม่เพี้ยน
 from pythainlp.util import normalize as thai_normalize
 import uvicorn
 import re
-import io
 import os
 
 app = FastAPI(title="e-GovDoc Python Backend Engine")
@@ -19,29 +18,33 @@ app.add_middleware(
 
 def extract_and_clean_pdf(file_bytes: bytes) -> str:
     try:
-        full_text_list = []
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            for page in pdf.pages:
-                # ดึงข้อความด้วย pdfplumber โดยรักษา Layout และช่องว่างระหว่างคำ (Spacebar) ต้นฉบับไว้ครบถ้วน
-                text = page.extract_text(layout=False)
-                if text:
-                    full_text_list.append(text)
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        paragraphs = []
         
-        full_text = "\n".join(full_text_list)
+        for page in doc:
+            # ดึงข้อมูลแบบ blocks ซึ่ง Word มักจะจัด 1 ย่อหน้า เป็น 1 Block เสมอ
+            blocks = page.get_text("blocks")
+            # เรียงลำดับพิกัดจากบนลงล่าง ซ้ายไปขวา
+            blocks.sort(key=lambda b: (round(b[1] / 10) * 10, b[0]))
+            
+            for b in blocks:
+                if b[6] == 0:  # Text block
+                    block_text = b[4].strip()
+                    if block_text:
+                        # แทนที่การขึ้นบรรทัดใหม่ภายใน Block เดียวกัน ให้เป็นช่องว่าง เพื่อรวมย่อหน้าให้ยาวต่อเนื่องเหมือน Word
+                        cleaned_block = re.sub(r'\r?\n', ' ', block_text)
+                        # จัดระเบียบช่องว่างซ้ำซ้อน
+                        cleaned_block = re.sub(r'[ \t]+', ' ', cleaned_block).strip()
+                        if cleaned_block:
+                            paragraphs.append(cleaned_block)
         
-        # 👑 ใช้ PyThaiNLP normalize มาตรฐานสากลเท่านั้น (ยกเลิก Regex แปลงสระอำทั้งหมด เพื่อปกป้องคำว่า ตุลาคม, เวลา, ฯลฯ)
+        # เชื่อมแต่ละย่อหน้าด้วยขึ้นบรรทัดใหม่
+        full_text = "\n\n".join(paragraphs)
+        
+        # ทำความสะอาดมาตรฐานด้วย PyThaiNLP (รักษาคำว่า ตุลาคม, จำกัด ไว้ครบถ้วนสมบูรณ์)
         normalized_text = thai_normalize(full_text)
         
-        # จัดระเบียบบรรทัด โดยคง Spacebar และโครงสร้างเดิมไว้ ไม่ให้คำติดกันหรือเพี้ยน
-        lines = normalized_text.splitlines()
-        cleaned_lines = []
-        for line in lines:
-            # ทำความสะอาดเฉพาะช่องว่างส่วนเกิน แต่ไม่แตะต้องตัวอักษรหรือคำศัพท์ของผู้ใช้
-            cleaned_line = re.sub(r'[ \t]+', ' ', line).strip()
-            if cleaned_line:
-                cleaned_lines.append(cleaned_line)
-                
-        return "\n".join(cleaned_lines)
+        return normalized_text
         
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"ไม่สามารถอ่านไฟล์ PDF ได้: {str(e)}")

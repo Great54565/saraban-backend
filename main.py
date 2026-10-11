@@ -19,46 +19,85 @@ app.add_middleware(
 def extract_and_clean_pdf(file_bytes: bytes) -> str:
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
+        all_lines = []
+        
+        # 1. ดึงข้อความและพิกัดทุกบรรทัดทั่วทั้งเอกสาร
+        for page_num, page in enumerate(doc):
+            blocks = page.get_text("dict").get("blocks", [])
+            for b in blocks:
+                if b.get("type") == 0:  # Text block
+                    for l in b.get("lines", []):
+                        bbox = l.get("bbox")  # (x0, y0, x1, y1)
+                        line_text = "".join([span.get("text", "") for span in l.get("spans", "")]).strip()
+                        if line_text:
+                            all_lines.append({
+                                "page": page_num,
+                                "y0": bbox[1],
+                                "y1": bbox[3],
+                                "x0": bbox[0],
+                                "x1": bbox[2],
+                                "text": line_text
+                            })
+        
+        if not all_lines:
+            return ""
+        
+        # 2. เรียงลำดับบรรทัดตามหน้า และพิกัดจากบนลงล่าง
+        all_lines.sort(key=lambda item: (item["page"], item["y0"], item["x0"]))
+        
+        # 3. คำนวณความสูงมาตรฐานของบรรทัดเพื่อใช้เป็นเกณฑ์ตัดสินย่อหน้า
+        heights = [l["y1"] - l["y0"] for l in all_lines if (l["y1"] - l["y0"]) > 0]
+        avg_height = sum(heights) / len(heights) if heights else 14.0
+        threshold_y = avg_height * 1.6  # หากช่องว่างมากกว่า 1.6 เท่า คือขึ้นย่อหน้าใหม่
+        
         paragraphs = []
+        current_para = []
+        last_line = None
         
-        for page in doc:
-            # ดึงโครงสร้างข้อความแบบละเอียด (Dict blocks) เพื่อรวมบรรทัดในย่อหน้าเดียวกัน
-            text_page = page.get_text("dict")
-            for block in text_page.get("blocks", []):
-                if block.get("type") == 0:  # Text block (ย่อหน้า/บล็อกข้อความ)
-                    paragraph_lines = []
-                    for line in block.get("lines", []):
-                        line_str = "".join([span.get("text", "") for span in line.get("spans", "")]).strip()
-                        if line_str:
-                            paragraph_lines.append(line_str)
-                    
-                    if paragraph_lines:
-                        # รวมบรรทัดที่ห่ออยู่ในย่อหน้าเดียวกันให้เป็นข้อความยาวต่อเนื่องเหมือน Word
-                        joined_line = ""
-                        for i, l in enumerate(paragraph_lines):
-                            if i == 0:
-                                joined_line += l
-                            else:
-                                # หากเป็นภาษาอังกฤษ/ตัวเลข ให้เว้นวรรค หากเป็นภาษาไทยเชื่อมต่อกันตามธรรมชาติ
-                                if re.search(r'[a-zA-Z0-9]$', joined_line) and re.search(r'^[a-zA-Z0-9]', l):
-                                    joined_line += " " + l
-                                else:
-                                    joined_line += l
-                        paragraphs.append(joined_line)
+        for line in all_lines:
+            if not current_para:
+                current_para.append(line["text"])
+                last_line = line
+                continue
+            
+            # เงื่อนไขการตัดย่อหน้าใหม่
+            is_new_page = line["page"] != last_line["page"]
+            y_gap = line["y0"] - last_line["y1"]
+            is_large_gap = y_gap > threshold_y
+            
+            # ตรวจสอบหัวข้อหรือรายการ (เช่น เรื่อง:, เรียน:, 1., 2., ฯลฯ) ให้ขึ้นบรรทัดใหม่เสมอ
+            is_header_or_bullet = bool(re.match(r'^(เรื่อง\s*[:：]|เรียน\s*[:：]|ส่วนราชการ\s*[:：]|ที่\s*[:：]|\d+[\.\)]|[ก-ฮ][\.\)]|[-•])', line["text"]))
+            
+            if is_new_page or is_large_gap or is_header_or_bullet:
+                paragraphs.append("".join(current_para))
+                current_para = [line["text"]]
+            else:
+                # บรรทัดต่อเนื่องในย่อหน้าเดิม: เชื่อมต่อข้อความเข้าด้วยกันแบบยาวต่อเนื่องเหมือน Word
+                prev_text = current_para[-1]
+                curr_text = line["text"]
+                
+                # หากเป็นภาษาอังกฤษ/ตัวเลขติดกัน ให้เว้นวรรค หากเป็นภาษาไทยเชื่อมต่อกันโดยตรง
+                if re.search(r'[a-zA-Z0-9]$', prev_text) and re.search(r'^[a-zA-Z0-9]', curr_text):
+                    current_para.append(" " + curr_text)
+                else:
+                    current_para.append(curr_text)
+            
+            last_line = line
         
-        # เชื่อมแต่ละย่อหน้าด้วยขึ้นบรรทัดใหม่
+        if current_para:
+            paragraphs.append("".join(current_para))
+        
         full_text = "\n\n".join(paragraphs)
         
-        # ระบบจัดการสระอำอัตโนมัติ (พร้อมเกราะป้องกันสระเอา เ-า)
-        cleaned_text = re.sub(r'(?<!เ)([ก-ฮ])\s+([ำา])', r'\1ำ', full_text)
+        # 4. ระบบจัดการสระอำอัตโนมัติ (พร้อมเกราะป้องกันสระเอา เ-า)
+        cleaned_text = re.sub(r'(?<!เ)([ก-ฮ])\s+([ำа])', r'\1ำ', full_text)
+        cleaned_text = re.sub(r'(?<!เ)([ก-ฮ])\s+([ำ])', r'\1ำ', full_text)
         
-        # ทำความสะอาดมาตรฐานด้วย PyThaiNLP และ Unicode NFC
+        # 5. ทำความสะอาดมาตรฐาน
         normalized_text = thai_normalize(cleaned_text)
+        final_paras = [re.sub(r'\s+', ' ', p).strip() for p in normalized_text.split("\n\n") if p.strip()]
         
-        # จัดระเบียบช่องว่างส่วนเกิน
-        lines = normalized_text.splitlines()
-        final_lines = [re.sub(r'\s+', ' ', line).strip() for line in lines if line.strip()]
-        return "\n".join(final_lines)
+        return "\n\n".join(final_paras)
         
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"ไม่สามารถอ่านไฟล์ PDF ได้: {str(e)}")

@@ -8,6 +8,7 @@ import os
 from fastapi.responses import FileResponse
 from pdf2docx import Converter
 import tempfile
+import docx
 
 app = FastAPI(title="e-GovDoc Python Backend Engine")
 
@@ -137,7 +138,6 @@ async def pdf_to_word_endpoint(file: UploadFile = File(...)):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="กรุณาอัปโหลดไฟล์ PDF เท่านั้น")
     
-    # สร้างไฟล์ชั่วคราวสำหรับ PDF และ DOCX ผลลัพธ์
     pdf_fd, pdf_path = tempfile.mkstemp(suffix=".pdf")
     os.close(pdf_fd)
     docx_path = pdf_path.replace(".pdf", ".docx")
@@ -147,12 +147,41 @@ async def pdf_to_word_endpoint(file: UploadFile = File(...)):
         with open(pdf_path, "wb") as f:
             f.write(content)
             
-        # แปลง PDF เป็น Word ด้วย pdf2docx
+        # 1. แปลง PDF เป็น Word ด้วย pdf2docx ตามปกติ
         cv = Converter(pdf_path)
         cv.convert(docx_path, start=0, end=None)
         cv.close()
         
-        # ส่งไฟล์ Word กลับไปให้ผู้ใช้ดาวน์โหลด
+        # 2. เปิดไฟล์ Word ผลลัพธ์ด้วย python-docx เพื่อซ่อมแซมสระอำเด็ดขาด
+        doc = docx.Document(docx_path)
+        
+        def fix_sara_am(text):
+            if not text:
+                return text
+            # กฎสระอำ: พยัญชนะไทย [ก-ฮ] + ช่องว่าง (\s+) + สระอา (า) -> แปลงเป็นสระอำ (ำ) ทันที
+            return re.sub(r'([ก-ฮ])\s+([า])', r'\1ำ', text)
+
+        # แก้ไขในทุกย่อหน้า (Paragraphs)
+        for p in doc.paragraphs:
+            if p.text:
+                fixed_text = fix_sara_am(p.text)
+                if fixed_text != p.text:
+                    p.text = fixed_text
+
+        # แก้ไขในทุกตาราง (Tables) ถ้ามี
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for p in cell.paragraphs:
+                        if p.text:
+                            fixed_text = fix_sara_am(p.text)
+                            if fixed_text != p.text:
+                                p.text = fixed_text
+                                
+        # บันทึกไฟล์ Word ที่ซ่อมแซมสระอำแล้วทับลงไป
+        doc.save(docx_path)
+        
+        # 3. ส่งไฟล์ Word กลับไปให้ผู้ใช้งานดาวน์โหลด
         output_filename = file.filename.rsplit(".", 1)[0] + ".docx"
         return FileResponse(
             docx_path,
@@ -163,9 +192,6 @@ async def pdf_to_word_endpoint(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"เกิดข้อผิดพลาดในการแปลงไฟล์: {str(e)}")
     finally:
-        # ทำความสะอาดไฟล์ชั่วคราวในระบบ (ถ้ามี)
         if os.path.exists(pdf_path):
-            try:
-                os.remove(pdf_path)
-            except:
-                pass
+            try: os.remove(pdf_path)
+            except: pass

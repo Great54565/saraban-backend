@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import fitz  # PyMuPDF สำหรับวิเคราะห์พิกัดเรขาคณิต PDF
+import fitz  # PyMuPDF
 from pythainlp.util import normalize as thai_normalize
 import uvicorn
 import re
@@ -22,57 +22,54 @@ def extract_and_clean_pdf(file_bytes: bytes) -> str:
         paragraphs = []
         
         for page in doc:
-            # ดึงโครงสร้างแบบ dict เพื่อเข้าถึง blocks, lines และพิกัด (bbox) อย่างละเอียด
-            blocks = page.get_text("dict").get("blocks", [])
+            # ดึงโครงสร้างบล็อกข้อความทั้งหมดในหน้า
+            blocks = page.get_text("blocks")
+            # เรียงลำดับพิกัดจากบนลงล่าง ซ้ายไปขวา
+            blocks.sort(key=lambda b: (round(b[1] / 10) * 10, b[0]))
+            
             for b in blocks:
-                if b.get("type") == 0:  # Text block
-                    block_lines = []
-                    for l in b.get("lines", []):
-                        line_text = "".join([span.get("text", "") for span in l.get("spans", "")]).strip()
-                        if line_text:
-                            block_lines.append({
-                                "text": line_text,
-                                "y0": l.get("bbox")[1],
-                                "y1": l.get("bbox")[3]
-                            })
+                if b[6] == 0:  # Text block
+                    raw_text = b[4].strip()
+                    if not raw_text:
+                        continue
                     
-                    if block_lines:
-                        # อัลกอริทึมรวมบรรทัดอัจฉริยะ (Smart Line Reflow)
-                        current_para_lines = [block_lines[0]["text"]]
+                    # แยกบรรทัดภายในบล็อก
+                    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+                    if not lines:
+                        continue
+                    
+                    # อัลกอริทึมสมานคำไทยที่ถูก PDF ตัดบรรทัดกลางอากาศอย่างไร้รอยต่อ
+                    reflowed_lines = []
+                    current_line = lines[0]
+                    
+                    for next_line in lines[1:]:
+                        # ตรวจสอบว่าเป็นหัวข้อหรือขึ้นต้นข้อใหม่หรือไม่ (เช่น 1., เรื่อง:, เรียน:, ส่วนราชการ)
+                        is_header_or_bullet = bool(re.match(r'^(\d+[\.\)]|[ก-ฮ][\.\)]|เรื่อง\s*[:：]|เรียน\s*[:：]|ส่วนราชการ\s*[:：]|บันทึกข้อความ)', next_line))
                         
-                        for i in range(1, len(block_lines)):
-                            prev = block_lines[i-1]
-                            curr = block_lines[i]
+                        if is_header_or_bullet:
+                            reflowed_lines.append(current_line)
+                            current_line = next_line
+                        else:
+                            last_char = current_line[-1] if current_line else ""
+                            first_char = next_line[0] if next_line else ""
                             
-                            # คำนวณระยะห่างแนวตั้ง (Vertical Gap) และความสูงบรรทัด (Line Height)
-                            gap = curr["y0"] - prev["y1"]
-                            line_height = prev["y1"] - prev["y0"]
-                            if line_height <= 0:
-                                line_height = 14.0
+                            # เช็คว่าเป็นตัวอักษรภาษาไทยทั้งคู่หรือไม่ (Unicode \u0E00-\u0E7F)
+                            is_thai_left = bool(re.match(r'[\u0E00-\u0E7F]', last_char))
+                            is_thai_right = bool(re.match(r'[\u0E00-\u0E7F]', first_char))
                             
-                            # ตรวจสอบว่าเป็นหัวข้อหรือรายการขึ้นต้นใหม่หรือไม่
-                            is_header_or_bullet = bool(re.match(r'^(บันทึกข้อความ|ส่วนราชการ|ที่\s*[:：]|เรื่อง\s*[:：]|เรียน\s*[:：]|\d+[\.\)]|[ก-ฮ][\.\)]|[-•])', curr["text"]))
-                            
-                            # เงื่อนไขรวมบรรทัด: ถ้าระยะห่างแคบ (ห่อคำในย่อหน้าเดียวกัน) และไม่ใช่หัวข้อใหม่
-                            if gap < (line_height * 1.8) and not is_header_or_bullet:
-                                prev_t = current_para_lines[-1]
-                                curr_t = curr["text"]
-                                # ถ้าฝั่งซ้ายเป็นอังกฤษ/ตัวเลขให้เว้นวรรค ถ้าเป็นไทยให้เชื่อมติดกัน
-                                if re.search(r'[a-zA-Z0-9]$', prev_t) and re.search(r'^[a-zA-Z0-9]', curr_t):
-                                    current_para_lines[-1] = prev_t + " " + curr_t
-                                else:
-                                    current_para_lines[-1] = prev_t + curr_t
+                            if is_thai_left and is_thai_right:
+                                # ถ้าเป็นไทยทั้งคู่ แปลว่าโดน PDF ตัดคำกลางอากาศ -> เชื่อมติดกันทันทีโดยไม่ใส่ช่องว่าง
+                                current_line += next_line
                             else:
-                                # หากระยะห่างกว้างหรือขึ้นหัวข้อใหม่ ให้ตัดเป็นบรรทัด/ย่อหน้าใหม่
-                                paragraphs.append("".join(current_para_lines))
-                                current_para_lines = [curr["text"]]
-                        
-                        if current_para_lines:
-                            paragraphs.append("".join(current_para_lines))
-        
+                                # ถ้ามีอังกฤษหรือตัวเลขปะปน ให้เว้นวรรคปกติ
+                                current_line += " " + next_line
+                                
+                    reflowed_lines.append(current_line)
+                    paragraphs.append("\n".join(reflowed_lines))
+                    
         full_text = "\n\n".join(paragraphs)
         
-        # 👑 ล็อกกฎสระอำตายตัว 100% ตามที่ตกลง (พยัญชนะ + ช่องว่าง + สระอา -> สระอำ)
+        # 👑 ล็อกกฎสระอำเด็ดขาด 100% ตามที่ตกลง (พยัญชนะ + ช่องว่าง + สระอา -> สระอำ)
         full_text = re.sub(r'([ก-ฮ])\s+([า])', r'\1ำ', full_text)
         
         # ทำความสะอาดมาตรฐานด้วย PyThaiNLP

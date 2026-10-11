@@ -22,24 +22,21 @@ def extract_and_clean_pdf(file_bytes: bytes) -> str:
         full_text_list = []
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             for page in pdf.pages:
-                # ใช้ extract_text() มาตรฐานของ pdfplumber เพื่อรักษาช่องว่างระหว่างคำ (Spacebar) ไว้ครบถ้วน
+                # ดึงข้อความด้วย pdfplumber โดยรักษา Layout และช่องว่างระหว่างคำ (Spacebar) ต้นฉบับไว้ครบถ้วน
                 text = page.extract_text(layout=False)
                 if text:
                     full_text_list.append(text)
         
         full_text = "\n".join(full_text_list)
         
-        # 👑 กฎสระอำเด็ดขาด 100% ตามที่พี่สั่ง: เจอพยัญชนะ ตามด้วยช่องว่าง และสระอา -> แปลงเป็นสระอำทันที
-        full_text = re.sub(r'([ก-ฮ])\s+([า])', r'\1ำ', full_text)
-        
-        # ทำความสะอาด Unicode มาตรฐานด้วย PyThaiNLP
+        # 👑 ใช้ PyThaiNLP normalize มาตรฐานสากลเท่านั้น (ยกเลิก Regex แปลงสระอำทั้งหมด เพื่อปกป้องคำว่า ตุลาคม, เวลา, ฯลฯ)
         normalized_text = thai_normalize(full_text)
         
-        # จัดระเบียบบรรทัด โดยคง Spacebar ต้นฉบับไว้ ไม่ให้คำติดกัน
+        # จัดระเบียบบรรทัด โดยคง Spacebar และโครงสร้างเดิมไว้ ไม่ให้คำติดกันหรือเพี้ยน
         lines = normalized_text.splitlines()
         cleaned_lines = []
         for line in lines:
-            # ตัดช่องว่างส่วนเกินหน้า/หลัง แต่รักษาช่องว่างระหว่างคำ (Spacebar) ไว้ปกติ
+            # ทำความสะอาดเฉพาะช่องว่างส่วนเกิน แต่ไม่แตะต้องตัวอักษรหรือคำศัพท์ของผู้ใช้
             cleaned_line = re.sub(r'[ \t]+', ' ', line).strip()
             if cleaned_line:
                 cleaned_lines.append(cleaned_line)

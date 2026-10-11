@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import fitz  # PyMuPDF
+import fitz  # PyMuPDF สำหรับสกัดโครงสร้างพิกัด PDF ระดับสากล
 from pythainlp.util import normalize as thai_normalize
 import uvicorn
 import re
@@ -22,29 +22,40 @@ def extract_and_clean_pdf(file_bytes: bytes) -> str:
         paragraphs = []
         
         for page in doc:
-            blocks = page.get_text("blocks")
-            blocks.sort(key=lambda b: (round(b[1] / 10) * 10, b[0]))
-            
+            # วิธีมาตรฐานสากล: ดึงโครงสร้าง Block และ Line เพื่อวิเคราะห์ Layout
+            blocks = page.get_text("dict").get("blocks", [])
             for b in blocks:
-                if b[6] == 0:  # Text block
-                    block_text = b[4].strip()
-                    if block_text:
-                        # 1. เชื่อมคำไทยที่ถูกตัดบรรทัดกลางประโยค (Soft Wrap) จากโครงสร้าง PDF
-                        block_text = re.sub(r'([\u0E00-\u0E7F])\r?\n([\u0E00-\u0E7F])', r'\1\2', block_text)
-                        
-                        # 2. แปลงการขึ้นบรรทัดใหม่ที่เหลือในบล็อกให้เป็นช่องว่างเพื่อให้โครงสร้างไหลต่อเนื่อง
-                        block_text = re.sub(r'\r?\n', ' ', block_text)
-                        paragraphs.append(block_text)
+                if b.get("type") == 0:  # Text block (บล็อกข้อความปกติ)
+                    para_lines = []
+                    for l in b.get("lines", []):
+                        line_text = "".join([span.get("text", "") for span in l.get("spans", "")]).strip()
+                        if line_text:
+                            para_lines.append(line_text)
+                    
+                    if para_lines:
+                        # อัลกอริทึมรวมบรรทัดสากล (Text Reflow): เชื่อมข้อความในบล็อกเดียวกันให้อยู่ในบรรทัดยาวต่อเนื่อง
+                        joined_line = ""
+                        for i, l in enumerate(para_lines):
+                            if i == 0:
+                                joined_line += l
+                            else:
+                                # หากรอยต่อเป็นภาษาอังกฤษหรือตัวเลขให้เว้นวรรค หากเป็นภาษาไทยให้เชื่อมติดกันอย่างไร้รอยต่อ
+                                if re.search(r'[a-zA-Z0-9]$', joined_line) and re.search(r'^[a-zA-Z0-9]', l):
+                                    joined_line += " " + l
+                                else:
+                                    joined_line += l
+                        paragraphs.append(joined_line)
         
+        # ประกอบบล็อกทั้งหมดเข้าด้วยกัน
         full_text = "\n\n".join(paragraphs)
         
-        # 3. แก้ไขเฉพาะช่องว่างทางเทคนิคของฟอนต์ PDF (เช่น สระและวรรณยุกต์ถูกแยกช่องว่างออก)
-        full_text = re.sub(r'(?<!เ)([ก-ฮ])\s+([ำา\u0E4D])', r'\1\2', full_text)
+        # 👑 กฎสระอำเด็ดขาด 100%: เห็นพยัญชนะ ตามด้วยช่องว่าง และสระอา -> ตีเป็นสระอำทันทีโดยไม่ต้องคิดเยอะ
+        full_text = re.sub(r'([ก-ฮ])\s+([า])', r'\1ำ', full_text)
         
-        # 4. ทำความสะอาดมาตรฐานด้วย Unicode Normalization (ไม่มีการใช้พจนานุกรมแก้คำผิด)
+        # ทำความสะอาดมาตรฐานด้วย Unicode Normalization ของ PyThaiNLP
         normalized_text = thai_normalize(full_text)
         
-        # 5. จัดระเบียบช่องว่างส่วนเกิน
+        # จัดระเบียบช่องว่างและโครงสร้างย่อหน้าให้สะอาดเรียบร้อย
         final_paras = [re.sub(r' {2,}', ' ', p).strip() for p in normalized_text.split("\n\n") if p.strip()]
         
         return "\n\n".join(final_paras)

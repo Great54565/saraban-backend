@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import fitz  # PyMuPDF อ่านตัวอักษรไทยแม่นยำ ไม่เพี้ยน
+import fitz  # PyMuPDF สำหรับแกะพิกัดเรขาคณิต
 from pythainlp.util import normalize as thai_normalize
 import uvicorn
 import re
@@ -16,85 +16,108 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def process_smart_structural_lines(raw_text: str) -> str:
-    lines = raw_text.splitlines()
-    processed_lines = []
-    
-    # 📌 กฎโครงสร้างหนังสือราชการ: หัวข้อสำคัญและรายการเหล่านี้ "ต้องขึ้นบรรทัดใหม่เสมอ (Hard Break)"
-    hard_break_pattern = re.compile(
-        r'^(บันทึกข้อความ|ส่วนราชการ\s*[:：]|ที่\s*[:：]|วันที่\s*[:：]|เรื่อง\s*[:：]|เรียน\s*[:：]|\d+[\.\)]|[๑-๙]+[\.\)]|[ก-ฮ][\.\)]|[-•*])'
-    )
-
-    current_para = ""
-
-    for line in lines:
-        clean_line = line.strip()
-        if not clean_line:
-            if current_para:
-                processed_lines.append(current_para)
-                current_para = ""
-            continue
-        
-        # ตรวจสอบว่าเป็นหัวข้อหรือรายการสำคัญตามระเบียบสารบรรณหรือไม่
-        if hard_break_pattern.match(clean_line):
-            if current_para:
-                processed_lines.append(current_para)
-                current_para = ""
-            processed_lines.append(clean_line)
-        else:
-            # เนื้อความภายในย่อหน้าเดียวกัน (Soft Break): นำมาเชื่อมต่อกันเป็นประโยคยาวแบบ Word
-            if not current_para:
-                current_para = clean_line
-            else:
-                last_char = current_para[-1]
-                first_char = clean_line[0]
-                is_thai_left = bool(re.match(r'[\u0E00-\u0E7F]', last_char))
-                is_thai_right = bool(re.match(r'[\u0E00-\u0E7F]', first_char))
-                
-                # ถ้าเป็นตัวอักษรไทยทั้งคู่ แปลว่าถูก PDF ตัดบรรทัดกลางคำ -> เชื่อมติดกันอย่างไร้รอยต่อ
-                if is_thai_left and is_thai_right:
-                    current_para += clean_line
-                else:
-                    current_para += " " + clean_line
-
-    if current_para:
-        processed_lines.append(current_para)
-
-    return "\n".join(processed_lines)
-
 def extract_and_clean_pdf(file_bytes: bytes) -> str:
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
-        page_texts = []
+        all_lines = []
         
-        for page in doc:
-            text = page.get_text("text")
-            if text:
-                page_texts.append(text)
+        # 1. ดึงข้อความพร้อมพิกัด Bounding Box ของแต่ละบรรทัดอย่างละเอียด
+        for page_num, page in enumerate(doc):
+            blocks = page.get_text("dict").get("blocks", [])
+            for b in blocks:
+                if b.get("type") == 0:  # Text block
+                    for l in b.get("lines", []):
+                        bbox = l.get("bbox")  # (x0, y0, x1, y1)
+                        line_text = "".join([span.get("text", "") for span in l.get("spans", "")]).strip()
+                        if line_text:
+                            all_lines.append({
+                                "page": page_num,
+                                "x0": bbox[0],
+                                "y0": bbox[1],
+                                "x1": bbox[2],
+                                "y1": bbox[3],
+                                "text": line_text
+                            })
         
-        full_text = "\n".join(page_texts)
+        if not all_lines:
+            return ""
         
-        # 1. จัดระเบียบย่อหน้าและบรรทัดด้วยระบบโครงสร้างสารบรรณ (Smart Structural Line Breaking)
-        structured_text = process_smart_structural_lines(full_text)
+        # เรียงลำดับบรรทัดตามหน้า และพิกัดจากบนลงล่าง ซ้ายไปขวา
+        all_lines.sort(key=lambda item: (item["page"], item["y0"], item["x0"]))
         
-        # 2. 👑 ล็อกกฎสระอำเด็ดขาด 100%: พยัญชนะ [ก-ฮ] + ช่องว่าง (\s+) + สระอา (า) -> สระอำ (ำ)
-        structured_text = re.sub(r'([ก-ฮ])\s+([า])', r'\1ำ', structured_text)
+        # 2. อัลกอริทึมวิเคราะห์ระยะห่างพิกัด (Geometry-based Line Reflow)
+        paragraphs = []
+        current_para_lines = []
+        prev_line = None
         
-        # 3. ทำความสะอาดมาตรฐานด้วย Unicode Normalization ของ PyThaiNLP
-        normalized_text = thai_normalize(structured_text)
+        for line in all_lines:
+            text = line["text"]
+            
+            if not prev_line:
+                current_para_lines.append(text)
+                prev_line = line
+                continue
+            
+            # หากเปลี่ยนหน้า ให้ขึ้นย่อหน้าใหม่
+            if line["page"] != prev_line["page"]:
+                if current_para_lines:
+                    paragraphs.append(" ".join(current_para_lines))
+                    current_para_lines = []
+                current_para_lines.append(text)
+                prev_line = line
+                continue
+            
+            # คำนวณระยะห่างแนวตั้ง (Vertical Gap) และความสูงของบรรทัด
+            y_gap = line["y0"] - prev_line["y1"]
+            line_height = prev_line["y1"] - prev_line["y0"]
+            if line_height <= 0:
+                line_height = 14.0
+            
+            # เกณฑ์ตัดสินใจ: ถ้าระยะห่างไม่เกิน 85% ของความสูงบรรทัด แปลว่าเป็นห่อคำในย่อหน้าเดียวกัน
+            threshold = line_height * 0.85
+            
+            if y_gap <= threshold:
+                # เชื่อมบรรทัดเข้าด้วยกัน (Soft Wrap)
+                last_t = current_para_lines[-1]
+                curr_t = text
+                
+                is_thai_left = bool(re.search(r'[\u0E00-\u0E7F]$', last_t))
+                is_thai_right = bool(re.search(r'^[\u0E00-\u0E7F]', curr_t))
+                
+                if is_thai_left and is_thai_right:
+                    current_para_lines[-1] = last_t + curr_t
+                else:
+                    current_para_lines[-1] = last_t + " " + curr_t
+            else:
+                # ระยะห่างกว้างกว่าปกติ แปลว่าเป็นขึ้นย่อหน้าใหม่หรือหัวข้อใหม่ (Hard Break)
+                if current_para_lines:
+                    paragraphs.append(" ".join(current_para_lines))
+                current_para_lines = [text]
+            
+            prev_line = line
+            
+        if current_para_lines:
+            paragraphs.append(" ".join(current_para_lines))
         
-        # 4. จัดระเบียบช่องว่างย่อหน้าให้สะอาดเรียบร้อย
-        lines = normalized_text.splitlines()
-        final_lines = [re.sub(r'[ \t]+', ' ', line).strip() for line in lines]
+        full_text = "\n\n".join(paragraphs)
         
-        return "\n".join(l for l in final_lines if l)
+        # 3. 👑 ล็อกกฎสระอำเด็ดขาด 100%: พยัญชนะ [ก-ฮ] + ช่องว่าง (\s+) + สระอา (า) -> สระอำ (ำ)
+        full_text = re.sub(r'([ก-ฮ])\s+([า])', r'\1ำ', full_text)
+        
+        # 4. ทำความสะอาดมาตรฐานด้วย PyThaiNLP
+        normalized_text = thai_normalize(full_text)
+        
+        # 5. จัดระเบียบช่องว่างย่อหน้าให้สะอาดเรียบร้อย
+        final_paras = [re.sub(r' {2,}', ' ', p).strip() for p in normalized_text.split("\n\n") if p.strip()]
+        
+        return "\n\n".join(final_paras)
         
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"ไม่สามารถอ่านไฟล์ PDF ได้: {str(e)}")
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "e-GovDoc Python Backend is running smoothly!"}
+    return {"status": "ok", "message": "e-GovDoc Python Backend (Geometry Engine) is running smoothly!"}
 
 @app.post("/api/extract-pdf")
 async def extract_pdf_endpoint(file: UploadFile = File(...)):

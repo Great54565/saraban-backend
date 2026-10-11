@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-import fitz  # PyMuPDF สำหรับสกัดข้อความ PDF อย่างเสถียร
+import fitz  # PyMuPDF สำหรับสกัดข้อความ PDF ขั้นสูง
 from pythainlp.util import normalize as thai_normalize
 import uvicorn
 import re
@@ -19,34 +19,44 @@ app.add_middleware(
 def extract_and_clean_pdf(file_bytes: bytes) -> str:
     try:
         doc = fitz.open(stream=file_bytes, filetype="pdf")
-        full_text = ""
+        paragraphs = []
         
         for page in doc:
-            # ใช้การดึงข้อความแบบ blocks พื้นฐานที่เสถียรและแม่นยำที่สุดของ PyMuPDF
+            # 1. ดึงข้อความทีละ Block (PyMuPDF จะตรวจจับโครงสร้าง "ย่อหน้า" ให้อัตโนมัติ)
             blocks = page.get_text("blocks")
-            # เรียงลำดับพิกัดจากบนลงล่าง ซ้ายไปขวา
+            # เรียงบล็อกตามพิกัด (บนลงล่าง ซ้ายไปขวา)
             blocks.sort(key=lambda b: (round(b[1] / 10) * 10, b[0]))
             
             for b in blocks:
-                block_text = b[4].strip()
-                if block_text:
-                    full_text += block_text + "\n"
+                if b[6] == 0:  # Type 0 คือ Text Block (ข้อความปกติ)
+                    block_text = b[4].strip()
+                    if block_text:
+                        # 2. ฟิวชันคำไทยที่ถูกหั่นครึ่ง (เช่น มุ่ง\nเน้น -> มุ่งเน้น)
+                        # วนลูปกำจัด \n ที่คั่นระหว่างพยัญชนะไทย เพื่อสมานคำที่ถูกตัดบรรทัด
+                        prev = ""
+                        while prev != block_text:
+                            prev = block_text
+                            block_text = re.sub(r'([\u0E00-\u0E7F])\r?\n([\u0E00-\u0E7F])', r'\1\2', block_text)
+                        
+                        # 3. เคลียร์ \n ที่ยังเหลืออยู่ในย่อหน้า เปลี่ยนเป็นช่องว่าง (เพื่อให้ไหลต่อเนื่องแบบ Word)
+                        block_text = re.sub(r'\r?\n', ' ', block_text)
+                        
+                        paragraphs.append(block_text)
         
-        # 1. ระบบจัดการสระอำอัตโนมัติที่แม่นยำ (พร้อมเกราะป้องกันสระเอา เ-า)
-        cleaned_text = re.sub(r'(?<!เ)([ก-ฮ])\s+([ำา])', r'\1ำ', full_text)
+        # 4. ประกอบบล็อกทั้งหมดกลับเป็นย่อหน้า คั่นด้วยการขึ้นบรรทัดใหม่
+        full_text = "\n\n".join(paragraphs)
         
-        # 2. ทำความสะอาดมาตรฐานด้วย PyThaiNLP และ Unicode NFC
-        normalized_text = thai_normalize(cleaned_text)
+        # 5. แก้ปัญหาสระอำกระจัดกระจายระดับ Unicode (ไม่ต้องพึ่งพจนานุกรม)
+        # ลบช่องว่างที่คั่นระหว่างพยัญชนะ กับ นิคหิต(วงกลม ํ) หรือ สระอา/สระอำ
+        full_text = re.sub(r'(?<!เ)([ก-ฮ])\s+([ำา\u0E4D])', r'\1\2', full_text)
         
-        # 3. จัดระเบียบแต่ละบรรทัดให้สะอาดเรียบร้อย (คงรูปแบบการขึ้นบรรทัดใหม่ของเอกสารไว้อย่างถูกต้อง)
-        lines = normalized_text.splitlines()
-        final_lines = []
-        for line in lines:
-            cleaned_line = re.sub(r'[ \t]+', ' ', line).strip()
-            if cleaned_line:
-                final_lines.append(cleaned_line)
-                
-        return "\n".join(final_lines)
+        # 6. พลังของ PyThaiNLP: หลอมรวม นิคหิต + สระอา ให้กลายเป็น "สระอำ" อัตโนมัติตามหลักภาษา
+        normalized_text = thai_normalize(full_text)
+        
+        # 7. จัดระเบียบช่องว่างที่ซ้ำซ้อนให้เหลือเคาะเดียว
+        final_paras = [re.sub(r' {2,}', ' ', p).strip() for p in normalized_text.split("\n\n") if p.strip()]
+        
+        return "\n\n".join(final_paras)
         
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"ไม่สามารถอ่านไฟล์ PDF ได้: {str(e)}")
